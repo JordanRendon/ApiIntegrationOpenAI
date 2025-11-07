@@ -127,7 +127,7 @@ async def analyze_catalog_search(
         
         # Volver a lógica anterior, split por comas
         if isinstance(search, str):
-            search_terms = [term.strip() for term in search.split(',') if term.strip()]
+            search_terms = [term.strip() for term in search.split('$$$') if term.strip()]
             search_list = search_terms
             print(f"[CONTROLLER] Detectadas {len(search_list)} búsquedas: {search_list}")
         else:
