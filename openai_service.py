@@ -515,18 +515,10 @@ class OpenAIService:
         return min(total_bonus, 0.6)  # Máximo bonus de 0.6
 
     def search_similar_products(self, query_embedding: np.ndarray, catalog_data: Dict[str, Any], 
-                              top_k: int = 5, search_text: str = "") -> List[Tuple[str, float, int]]:
+                              top_k: int = 10, search_text: str = "") -> List[Tuple[str, float, int]]:
         """
         Busca productos similares usando el índice FAISS con re-ranking híbrido.
-        
-        Args:
-            query_embedding: Embedding de la consulta (shape: [1, embedding_dim])
-            catalog_data: Datos del catálogo desde vector_cache
-            top_k: Número de productos más similares a retornar
-            search_text: Texto original de búsqueda para extraer especificaciones
-            
-        Returns:
-            Lista de tuplas (producto, score_ajustado, índice) ordenada por relevancia
+        Devuelve una lista más larga que top_k para que GPT escoja las alternativas.
         """
         try:
             faiss_index = catalog_data['faiss_index']
@@ -535,8 +527,8 @@ class OpenAIService:
             # Normalizar query embedding para similitud coseno
             faiss.normalize_L2(query_embedding)
             
-            # Buscar más productos inicialmente para tener opciones para re-ranking
-            initial_k = min(top_k * 10, len(catalog))  # 10x más productos para filtrar
+            # Buscar más productos inicialmente para tener opciones (usamos top_k como el número de candidatos a devolver)
+            initial_k = min(top_k, len(catalog)) 
             scores, indices = faiss_index.search(query_embedding, initial_k)
             
             # Extraer especificaciones de la búsqueda
@@ -559,9 +551,9 @@ class OpenAIService:
             
             # Ordenar por score final (híbrido) y tomar solo los top_k
             results.sort(key=lambda x: x[1], reverse=True)
-            final_results = results[:top_k]
+            final_results = results
             
-            print(f"[HYBRID_SEARCH] Encontrados {len(final_results)} productos (de {initial_k} candidatos)")
+            print(f"[HYBRID_SEARCH] Encontrados {len(final_results)} productos candidatos para el LLM.")
             for i, (product, score, idx) in enumerate(final_results[:3]):  # Mostrar top 3
                 print(f"  {i+1}. {product[:60]}... (score: {score:.4f})")
             
@@ -574,7 +566,6 @@ class OpenAIService:
         self,
         search: List[str],
         catalog: List[str],
-        max_results: int = None,
         prompt: str = None
     ) -> tuple[dict, int, int]:
         """
@@ -597,7 +588,6 @@ class OpenAIService:
             print("[VECTOR_SEARCH] Iniciando análisis con sistema vectorial")
             print(f"[VECTOR_SEARCH] Búsquedas: {search}")
             print(f"[VECTOR_SEARCH] Catálogo: {len(catalog)} productos")
-            print(f"[VECTOR_SEARCH] Max results: {max_results}")
             print(f"[VECTOR_SEARCH] Prompt length: {len(prompt) if prompt else 0}")
             print("=" * 80)
             
@@ -637,94 +627,116 @@ class OpenAIService:
                 print(f"[VECTOR_SEARCH] Usando catálogo desde caché vectorial")
                 print(f"[VECTOR_SEARCH] Productos en caché: {catalog_data['product_count']}")
             
-            # 3. Determinar número de resultados
-            if max_results is not None:
-                n_results = max_results
-            else:
-                n_results = self.analyze_search_intent(search[0])
+            max_alternatives = self.extract_max_alternatives(prompt or "")
+            candidates_to_fetch = max_alternatives + 1
+            faiss_fetch_k = max(candidates_to_fetch * 2, 5)
+
+            print(f"[VECTOR_SEARCH] Max alternativas solicitadas: {max_alternatives}")
+            print(f"[VECTOR_SEARCH] FAISS buscará {faiss_fetch_k} candidatos por término.")
             
             # 4. Procesar cada búsqueda
-            all_matches = []
+            all_candidates_by_search_term = {}
             total_search_tokens = 0
             
             for search_term in search:
                 print(f"[VECTOR_SEARCH] Procesando búsqueda: '{search_term}'")
                 
                 # Generar embedding de la búsqueda
-                search_embedding = self.generate_embeddings([search_term])
-                
-                # Buscar productos similares con sistema híbrido
-                similar_products = self.search_similar_products(
-                    search_embedding, catalog_data, top_k=min(10, len(catalog)), search_text=search_term
+                query_embedding_response = self.client.embeddings.create(
+                    model=self.embedding_model,
+                    input=[search_term],
+                    encoding_format="float"
                 )
                 
-                # Tomar solo los top N más relevantes para enviar al modelo
-                top_products = similar_products[:min(n_results * 2, 5)]  # Máximo 5 productos
+                query_embedding = np.array(query_embedding_response.data[0].embedding, dtype=np.float32).reshape(1, -1)
+                total_search_tokens += query_embedding_response.usage.total_tokens
+
+                # Buscar productos similares con sistema híbrido
+                similar_products_data = self.search_similar_products(
+                    query_embedding=query_embedding,
+                    catalog_data=catalog_data,
+                    top_k=faiss_fetch_k,
+                    search_text=search_term
+                )
+                
+                all_candidates_by_search_term[search_term] = similar_products_data[:candidates_to_fetch]
+
+                # Preparar el contexto de los productos para el LLM y el prompt final
+            products_context_text = ""
+            user_prompt = "Analiza los candidatos proporcionados para cada término de búsqueda. "
                 
                 # Preparar mini-catálogo con solo los productos relevantes
-                mini_catalog = []
-                for i, (product, score, original_idx) in enumerate(top_products):
-                    mini_catalog.append(f"{i}. {product}")
-                
-                mini_catalog_str = "\n".join(mini_catalog)
-                
-                # Preparar prompt personalizado o usar el por defecto
-                if not prompt or prompt.strip() == "":
-                    system_prompt = """Eres un experto en productos médicos, farmacéuticos y dispositivos hospitalarios.
-Analiza el término de búsqueda contra el catálogo pre-filtrado y retorna los productos más relevantes."""
-                else:
-                    system_prompt = self.clean_prompt(prompt)
-                
-                # Construir mensaje para el modelo
-                user_message = f"""BÚSQUEDA: "{search_term}"
+            for search_term, candidates in all_candidates_by_search_term.items():
+                user_prompt += f"\n\n--- Término de Búsqueda: {search_term} ---\n"
 
-CATÁLOGO PRE-FILTRADO (productos más similares):
-{mini_catalog_str}
+                # Inyectamos los candidatos en el prompt del usuario como contexto
+                context_list = []
+                for i, (product, score, index) in enumerate(candidates):
+                    context_list.append(f"CANDIDATO {i+1} (CAT-INDEX {index}): {product} (FAISS-Score: {score:.4f})")
 
-INSTRUCCIONES:
-- Retorna SOLO los {n_results} productos más relevantes
-- Calcula un confidence score (0.0 a 1.0) para cada match
-- Ordena por relevancia descendente
-- Usa el nombre EXACTO del producto del catálogo
-- Retorna JSON con esta estructura:
-{{
-    "matches": [
-        {{"item": "nombre exacto del producto", "confidence": 0.95, "index": 0}},
-        ...
-    ]
-}}"""
+                products_context_text += f"\n\n--- Candidatos para '{search_term}' ---\n"
+                products_context_text += "\n".join(context_list)
                 
+            # Preparar prompt personalizado o usar el por defecto
+            if prompt:
+                user_prompt += f"\n\nInstrucciones adicionales del usuario: {self.clean_prompt(prompt)}"
+
+                system_prompt = f"""
+Eres un motor de análisis de catálogos. Tu tarea es analizar la solicitud del usuario y el conjunto de productos candidatos proporcionados como contexto, para encontrar la **mejor coincidencia** y hasta **{max_alternatives} alternativas** si fueron solicitadas.
+
+**REGLAS ESTRICTAS:**
+1. La respuesta debe ser un objeto JSON VÁLIDO con la siguiente estructura (NO DEBES incluir ningún otro texto, solo el JSON):
+   {{
+         "matches": [
+              {{
+                "search": "El término de búsqueda original.",
+                "item": "El MEJOR producto del catálogo (nombre EXACTO del CANDIDATO).",
+                "confidence": "Puntuación de 0.0 a 1.0 (0.95 si es exacto).",
+                "index": "El 'CAT-INDEX' del producto principal.",
+                "alternatives": [
+                    // Este array DEBE contener hasta {max_alternatives} objetos con las mejores alternativas
+                    {{
+                        "item": "El producto alternativo 1 (nombre EXACTO del CANDIDATO).",
+                        "confidence": "Puntuación de 0.0 a 1.0.",
+                        "index": "El 'CAT-INDEX' del producto alternativo 1."
+                    }},
+                    {{
+                        "item": "El producto alternativo 2 (nombre EXACTO del CANDIDATO).",
+                        "confidence": "Puntuación de 0.0 a 1.0.",
+                        "index": "El 'CAT-INDEX' del producto alternativo 2."
+                    }},
+                    ...
+                ]
+              }},
+              ...
+         ]
+    }}
+2. Utiliza **exclusivamente** los nombres de productos y los índices de los **CANDIDATOS** inyectados en el contexto (CANDIDATO X (CAT-INDEX Y): Producto).
+3. Si el usuario no solicitó alternativas (max_alternatives es 0), el array "alternatives" debe ser un array vacío: `[]`.
+"""
+            final_system_message = self.clean_prompt(system_prompt + products_context_text) # Inyectamos el contexto al system prompt
+
                 # Llamada al modelo GPT con mini-catálogo
-                response = self.client.chat.completions.create(
-                    model=self.vision_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    top_p=self.top_p,
-                    response_format={"type": "json_object"}
-                )
+            response = self.client.chat.completions.create(
+                model=self.vision_model,
+                messages=[
+                    {"role": "system", "content": final_system_message},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                top_p=self.top_p,
+                response_format={"type": "json_object"}
+            )
                 
-                if not response.choices or not response.choices[0].message.content:
+            if not response.choices or not response.choices[0].message.content:
                     raise ValueError("Empty response from model")
                 
-                # Procesar resultado
-                result = self.clean_json_response(response.choices[0].message.content)
-                matches = result.get('matches', [])
-                
-                # Mapear índices del mini-catálogo a índices originales
-                for match in matches:
-                    mini_idx = match.get('index', 0)
-                    if mini_idx < len(top_products):
-                        original_idx = top_products[mini_idx][2]
-                        match['index'] = int(original_idx)  # Convertir a int nativo de Python
-                
-                all_matches.extend(matches)
-                total_search_tokens += response.usage.prompt_tokens + response.usage.completion_tokens
-                
-                print(f"[VECTOR_SEARCH] Encontrados {len(matches)} matches para '{search_term}'")
+            # Procesar resultado
+            result = self.clean_json_response(response.choices[0].message.content)
+            
+            all_matches = result.get('matches', [])
+            total_search_tokens += response.usage.prompt_tokens + response.usage.completion_tokens             
             
             # 5. Calcular costos y tokens
             embedding_cost = (embedding_tokens / 1_000_000) * 0.020 if embedding_tokens > 0 else 0
@@ -924,3 +936,35 @@ INSTRUCCIONES:
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error analyzing catalog: {str(e)}")
+        
+    # openai_service.py (Añadir dentro de la clase OpenAIService)
+
+    def extract_max_alternatives(self, prompt: str) -> int:
+        """
+        Analiza el prompt del usuario para encontrar peticiones de alternativas.
+        Ejemplos: "dame 3 alternativas", "necesito otras 2 opciones", "lista 4 productos similares".
+        
+        Returns:
+            int: Número de alternativas solicitadas (0 si no se encuentra).
+        """
+        if not prompt:
+            return 0
+        
+        prompt_lower = prompt.lower()
+        
+        # Patrones comunes para buscar: (\d+|uno|dos|tres|cuatro|cinco) + (alternativa|opción|similar|producto)
+        
+        # 1. Patrón numérico (ej: "3 alternativas", "2 opciones")
+        match_num = re.search(r'(\d+)\s+(?:alternativas?|opciones?|similares?|productos?)', prompt_lower)
+        if match_num:
+            return int(match_num.group(1))
+
+        # 2. Patrón de palabras (solo los más comunes)
+        word_to_num = {'uno': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5}
+        for word, num in word_to_num.items():
+            if f" {word} " in prompt_lower or prompt_lower.endswith(f" {word}"):
+                if any(kw in prompt_lower for kw in ['alternativa', 'opcion', 'similar', 'producto']):
+                    print(f"[PROMPT_ANALYSIS] Detectado: '{word}' -> {num} alternativas")
+                    return num
+        
+        return 0
