@@ -566,7 +566,8 @@ class OpenAIService:
         self,
         search: List[str],
         catalog: List[str],
-        prompt: str = None
+        prompt: str = None,
+        max_alternatives: int = 0
     ) -> tuple[dict, int, int]:
         """
         Analiza catálogo usando Vector Search con embeddings para máxima eficiencia.
@@ -627,11 +628,11 @@ class OpenAIService:
                 print(f"[VECTOR_SEARCH] Usando catálogo desde caché vectorial")
                 print(f"[VECTOR_SEARCH] Productos en caché: {catalog_data['product_count']}")
             
-            max_alternatives = self.extract_max_alternatives(prompt or "")
-            candidates_to_fetch = max_alternatives + 1
+            max_alternatives_val = max_alternatives if max_alternatives is not None else 0
+            candidates_to_fetch = max_alternatives_val + 1
             faiss_fetch_k = max(candidates_to_fetch * 2, 5)
 
-            print(f"[VECTOR_SEARCH] Max alternativas solicitadas: {max_alternatives}")
+            print(f"[VECTOR_SEARCH] Max alternativas solicitadas: {max_alternatives_val}")
             print(f"[VECTOR_SEARCH] FAISS buscará {faiss_fetch_k} candidatos por término.")
             
             # 4. Procesar cada búsqueda
@@ -682,7 +683,7 @@ class OpenAIService:
                 user_prompt += f"\n\nInstrucciones adicionales del usuario: {self.clean_prompt(prompt)}"
 
                 system_prompt = f"""
-Eres un motor de análisis de catálogos. Tu tarea es analizar la solicitud del usuario y el conjunto de productos candidatos proporcionados como contexto, para encontrar la **mejor coincidencia** y hasta **{max_alternatives} alternativas** si fueron solicitadas.
+Eres un motor de análisis de catálogos. Tu tarea es analizar la solicitud del usuario y el conjunto de productos candidatos proporcionados como contexto, para encontrar la **mejor coincidencia** y hasta **{max_alternatives_val} alternativas** si fueron solicitadas.
 
 **REGLAS ESTRICTAS:**
 1. La respuesta debe ser un objeto JSON VÁLIDO con la siguiente estructura (NO DEBES incluir ningún otro texto, solo el JSON):
@@ -694,7 +695,10 @@ Eres un motor de análisis de catálogos. Tu tarea es analizar la solicitud del 
                 "confidence": "Puntuación de 0.0 a 1.0 (0.95 si es exacto).",
                 "index": "El 'CAT-INDEX' del producto principal.",
                 "alternatives": [
-                    // Este array DEBE contener hasta {max_alternatives} objetos con las mejores alternativas
+                    // Este array DEBE contener hasta {max_alternatives_val} objetos con las mejores alternativas
+                    // 💡 CAMBIO CRÍTICO: Añadir la regla de que la alternativa DEBE ser el siguiente candidato.
+                    // Si se solicita N > 0 alternativas, la primera alternativa DEBE ser el CANDIDATO 2, si es válido.
+                    {{
                     {{
                         "item": "El producto alternativo 1 (nombre EXACTO del CANDIDATO).",
                         "confidence": "Puntuación de 0.0 a 1.0.",

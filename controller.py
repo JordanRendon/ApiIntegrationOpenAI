@@ -73,6 +73,7 @@ async def analyze_catalog_search(
     file: UploadFile = File(...),
     search: str = Form(...),
     prompt: str = Form(""),
+    max_alternatives: int = Form(None),
     use_vectors: bool = Query(True, description="Usar Vector Search para máxima eficiencia")
 ):
     """
@@ -83,6 +84,7 @@ async def analyze_catalog_search(
     - file: Archivo .txt con el catálogo (un producto por línea)
     - search: Término de búsqueda (string)
     - prompt: (Opcional) Instrucciones personalizadas para OpenAI
+    - max_alternatives: (Opcional) Número máximo de alternativas
     - use_vectors: (Query param) Si es True, usa Vector Search con embeddings (RECOMENDADO).
                    Si es False, usa el método tradicional.
 
@@ -93,7 +95,7 @@ async def analyze_catalog_search(
     file: catalog.txt (archivo con productos, uno por línea)
     search: "GASA HEMOSTATICA DE 20X10"
     prompt: "Instrucciones personalizadas..." (opcional)
-    max_results: 3 (opcional)
+    max_alternatives: (opcional)
     
     BENEFICIOS DEL VECTOR SEARCH (use_vectors=true):
     - 90% menos tokens (~400 vs ~3,800)
@@ -106,6 +108,7 @@ async def analyze_catalog_search(
     print(f"[CONTROLLER] Recibido request en /catalog/analyze (vectors={use_vectors})")
     print(f"[CONTROLLER] Archivo: {file.filename}")
     print(f"[CONTROLLER] Search: {search}")
+    print(f"[CONTROLLER] Max results: {max_alternatives}")
     print(f"[CONTROLLER] Prompt length: {len(prompt) if prompt else 0}")
     print("=" * 80)
     
@@ -139,6 +142,7 @@ async def analyze_catalog_search(
             result, tokens_input, tokens_output = await openai_service.analyze_catalog_with_vectors(
                 search=search_list,
                 catalog=catalog,
+                max_alternatives=max_alternatives,
                 prompt=prompt
             )
         else:
@@ -146,6 +150,7 @@ async def analyze_catalog_search(
             result, tokens_input, tokens_output = await openai_service.analyze_catalog(
                 search=search_list,
                 catalog=catalog,
+                max_alternatives=max_alternatives,
                 prompt=prompt
             )
 
