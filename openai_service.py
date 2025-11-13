@@ -562,6 +562,28 @@ class OpenAIService:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error searching similar products: {str(e)}")
 
+    def coincide_molecula_y_concentracion(self, search_term: str, producto: str) -> bool:
+        """
+        Retorna True si las moléculas y concentraciones coinciden sin importar el orden.
+        Ejemplo: 'SALMETEROL + FLUTICASONA 25+125MCG' == 'FLUTICASONA+SALMETEROL (125MCG+25MCG)'
+        """
+        import re
+        def extraer_principios(texto):
+            texto = texto.lower()
+            texto = re.sub(r'[^a-z0-9+]', ' ', texto) # Quita símbolos pero deja +
+            partes = [p.strip() for p in texto.split('+') if p.strip()]
+            return partes
+        def extraer_concentraciones(texto):
+            # Busca todas las concentraciones del tipo 25MCG, 125MG, etc.
+            return sorted(re.findall(r'\d+\s*[a-z]+', texto.lower()))
+
+        p1 = set(extraer_principios(search_term))
+        p2 = set(extraer_principios(producto))
+        c1 = set(extraer_concentraciones(search_term))
+        c2 = set(extraer_concentraciones(producto))
+        # Si ambos conjuntos no son vaciós y coinciden exactamente
+        return bool(p1) and bool(p2) and p1 == p2 and c1 == c2
+
     async def analyze_catalog_with_vectors(
         self,
         search: List[str],
@@ -642,26 +664,35 @@ class OpenAIService:
             for search_term in search:
                 print(f"[VECTOR_SEARCH] Procesando búsqueda: '{search_term}'")
                 
-                # Generar embedding de la búsqueda
-                query_embedding_response = self.client.embeddings.create(
-                    model=self.embedding_model,
-                    input=[search_term],
-                    encoding_format="float"
-                )
-                
-                query_embedding = np.array(query_embedding_response.data[0].embedding, dtype=np.float32).reshape(1, -1)
-                total_search_tokens += query_embedding_response.usage.total_tokens
+                # FILTRO PREVIO: buscar coincidencias exactas en TODO el catálogo
+                matches_exactos = []
+                for idx, producto in enumerate(catalog):
+                    if self.coincide_molecula_y_concentracion(search_term, producto):
+                        matches_exactos.append((producto, 1.0, idx)) # (producto, score=1.0, idx)
 
-                # Buscar productos similares con sistema híbrido
-                similar_products_data = self.search_similar_products(
-                    query_embedding=query_embedding,
-                    catalog_data=catalog_data,
-                    top_k=faiss_fetch_k,
-                    search_text=search_term
-                )
-                
-                all_candidates_by_search_term[search_term] = similar_products_data[:candidates_to_fetch]
+                if matches_exactos:
+                    candidates = matches_exactos[:(max_alternatives_val or 0)+1]
+                    print(f"[PRE-FILTRO MOL/CONC] Se encontraron {len(candidates)} matches exactos en catálogo para '{search_term}'")
+                else:
+                    # Vector search solo como fallback si no hay exactos
+                    query_embedding_response = self.client.embeddings.create(
+                        model=self.embedding_model,
+                        input=[search_term],
+                        encoding_format="float"
+                    )
+                    query_embedding = np.array(query_embedding_response.data[0].embedding, dtype=np.float32).reshape(1, -1)
+                    total_search_tokens += query_embedding_response.usage.total_tokens
+                    similar_products_data = self.search_similar_products(
+                        query_embedding=query_embedding,
+                        catalog_data=self.vector_cache.get_catalog_data(self.vector_cache.get_catalog_hash(catalog)),
+                        top_k=max(((max_alternatives_val or 0)+1)*2, 5),
+                        search_text=search_term
+                    )
+                    candidates = similar_products_data
+                    print(f"[VECTOR SEARCH] Usando productos más similares FAISS para '{search_term}'")
 
+                all_candidates_by_search_term[search_term] = candidates
+                
                 # Preparar el contexto de los productos para el LLM y el prompt final
             products_context_text = ""
             user_prompt = "Analiza los candidatos proporcionados para cada término de búsqueda. "
@@ -683,41 +714,57 @@ class OpenAIService:
                 user_prompt += f"\n\nInstrucciones adicionales del usuario: {self.clean_prompt(prompt)}"
 
                 system_prompt = f"""
-Eres un motor de análisis de catálogos. Tu tarea es analizar la solicitud del usuario y el conjunto de productos candidatos proporcionados como contexto, para encontrar la **mejor coincidencia** y hasta **{max_alternatives_val} alternativas** si fueron solicitadas.
+                Eres un especialista en insumos médico-quirúrgicos con profundo conocimiento en dispositivos, materiales hospitalarios y productos farmacéuticos.
 
-**REGLAS ESTRICTAS:**
-1. La respuesta debe ser un objeto JSON VÁLIDO con la siguiente estructura (NO DEBES incluir ningún otro texto, solo el JSON):
-   {{
-         "matches": [
-              {{
-                "search": "El término de búsqueda original.",
-                "item": "El MEJOR producto del catálogo (nombre EXACTO del CANDIDATO).",
-                "confidence": "Puntuación de 0.0 a 1.0 (0.95 si es exacto).",
-                "index": "El 'CAT-INDEX' del producto principal.",
-                "alternatives": [
-                    // Este array DEBE contener hasta {max_alternatives_val} objetos con las mejores alternativas
-                    // 💡 CAMBIO CRÍTICO: Añadir la regla de que la alternativa DEBE ser el siguiente candidato.
-                    // Si se solicita N > 0 alternativas, la primera alternativa DEBE ser el CANDIDATO 2, si es válido.
+                Tu tarea es analizar un término de búsqueda y un conjunto de productos candidatos (provenientes del catálogo) para identificar el producto principal y las posibles alternativas válidas.
+
+                === REGLAS DE ANÁLISIS (CRÍTICAS) ===
+                1️⃣ Producto principal:
+                - Debe ser el producto más similar o idéntico al término buscado.
+                - Coincidencia exacta de moléculas y forma farmacéutica preferida.
+                2️⃣ Alternativas válidas:
+                - Misma molécula o combinación de principios activos (sin importar el orden).
+                - Misma concentración exacta en valores y unidades (25+125MCG = 25MCG+125MCG).
+                - Misma forma farmacéutica (tableta, aerosol, cápsula, suspensión, etc.).
+                - Solo puede variar el laboratorio o fabricante.
+                - Si difiere cualquier valor o unidad → descartar.
+                3️⃣ Si no existen alternativas válidas:
+                Devuelve solo el producto principal con:
+                {{ "mensaje": "No hay alternativas disponibles" }}
+                4️⃣ Si el producto principal no está en el catálogo:
+                Devuelve:
+                {{ "mensaje": "Producto principal no encontrado en catálogo" }}
+
+                === FORMATO JSON OBLIGATORIO ===
+                {{
+                "matches": [
                     {{
-                    {{
-                        "item": "El producto alternativo 1 (nombre EXACTO del CANDIDATO).",
-                        "confidence": "Puntuación de 0.0 a 1.0.",
-                        "index": "El 'CAT-INDEX' del producto alternativo 1."
-                    }},
-                    {{
-                        "item": "El producto alternativo 2 (nombre EXACTO del CANDIDATO).",
-                        "confidence": "Puntuación de 0.0 a 1.0.",
-                        "index": "El 'CAT-INDEX' del producto alternativo 2."
-                    }},
-                    ...
+                        "search": "término de búsqueda original",
+                        "item": "nombre exacto del producto principal (del catálogo)",
+                        "confidence": "valor entre 0.0 y 1.0",
+                        "index": "CAT-INDEX del producto principal",
+                        "alternatives": [
+                            {{
+                                "item": "nombre exacto del producto alternativo",
+                                "confidence": "valor entre 0.0 y 1.0",
+                                "index": "CAT-INDEX del alternativo"
+                            }}
+                        ]
+                    }}
                 ]
-              }},
-              ...
-         ]
-    }}
-2. Utiliza **exclusivamente** los nombres de productos y los índices de los **CANDIDATOS** inyectados en el contexto (CANDIDATO X (CAT-INDEX Y): Producto).
-3. Si el usuario no solicitó alternativas (max_alternatives es 0), el array "alternatives" debe ser un array vacío: `[]`.
-"""
+                }}
+
+                === CONTEXTO DEL CATÁLOGO ===
+                {products_context_text}
+
+                === INSTRUCCIONES ADICIONALES ===
+                {self.clean_prompt(prompt)}
+                """
+            else:
+                system_prompt = f"""
+                Eres un motor de análisis de catálogos...
+                # (mantén el prompt anterior si el usuario no pasa prompt personalizado)
+                """
             final_system_message = self.clean_prompt(system_prompt + products_context_text) # Inyectamos el contexto al system prompt
 
                 # Llamada al modelo GPT con mini-catálogo
