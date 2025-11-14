@@ -584,6 +584,11 @@ class OpenAIService:
         # Si ambos conjuntos no son vaciós y coinciden exactamente
         return bool(p1) and bool(p2) and p1 == p2 and c1 == c2
 
+    def es_nombre_igual(self, a: str, b: str) -> bool:
+        import re
+        limpia = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
+        return limpia(a) == limpia(b)
+
     async def analyze_catalog_with_vectors(
         self,
         search: List[str],
@@ -666,13 +671,20 @@ class OpenAIService:
                 
                 # FILTRO PREVIO: buscar coincidencias exactas en TODO el catálogo
                 matches_exactos = []
+                match_igual = None
                 for idx, producto in enumerate(catalog):
                     if self.coincide_molecula_y_concentracion(search_term, producto):
-                        matches_exactos.append((producto, 1.0, idx)) # (producto, score=1.0, idx)
-
+                        matches_exactos.append((producto, 1.0, idx))
+                        if self.es_nombre_igual(search_term, producto):
+                            match_igual = (producto, 1.0, idx)
                 if matches_exactos:
-                    candidates = matches_exactos[:(max_alternatives_val or 0)+1]
-                    print(f"[PRE-FILTRO MOL/CONC] Se encontraron {len(candidates)} matches exactos en catálogo para '{search_term}'")
+                    # Si existe un match exactamente igual en nombre, ordena la lista con ese primero
+                    if match_igual and match_igual in matches_exactos:
+                        matches_exactos.remove(match_igual)
+                        candidates = [match_igual] + matches_exactos[:(max_alternatives_val or 0)]
+                    else:
+                        candidates = matches_exactos[:(max_alternatives_val or 0)+1]
+                    print(f"[PRE-FILTRO MOL/CONC] Se encontraron {len(matches_exactos)} matches exactos en catálogo para '{search_term}' (match_igual={'sí' if match_igual else 'no'})")
                 else:
                     # Vector search solo como fallback si no hay exactos
                     query_embedding_response = self.client.embeddings.create(
@@ -785,8 +797,12 @@ class OpenAIService:
                 
             # Procesar resultado
             result = self.clean_json_response(response.choices[0].message.content)
-            
             all_matches = result.get('matches', [])
+            # Truncar alternatives según max_alternatives solicitado
+            if max_alternatives:
+                for match in all_matches:
+                    if 'alternatives' in match and isinstance(match['alternatives'], list):
+                        match['alternatives'] = match['alternatives'][:max_alternatives]
             total_search_tokens += response.usage.prompt_tokens + response.usage.completion_tokens             
             
             # 5. Calcular costos y tokens
