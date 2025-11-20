@@ -798,11 +798,45 @@ class OpenAIService:
             # Procesar resultado
             result = self.clean_json_response(response.choices[0].message.content)
             all_matches = result.get('matches', [])
-            # Truncar alternatives según max_alternatives solicitado
-            if max_alternatives:
-                for match in all_matches:
-                    if 'alternatives' in match and isinstance(match['alternatives'], list):
-                        match['alternatives'] = match['alternatives'][:max_alternatives]
+            
+            # Si no hay matches, retornar vacío (el LLM ya debería haber manejado esto)
+            if not all_matches:
+                return {"matches": []}, total_search_tokens, 0
+            
+            # Truncar alternatives según max_alternatives solicitado y validar mensajes
+            max_alternatives_val = max_alternatives if max_alternatives is not None else 0
+            
+            # Procesar cada match para validar alternativas y agregar mensajes
+            for match in all_matches:
+                # Asegurar que alternatives existe y es una lista
+                if 'alternatives' not in match:
+                    match['alternatives'] = []
+                elif not isinstance(match['alternatives'], list):
+                    match['alternatives'] = []
+                
+                # Solo validar mensajes si se solicitó max_alternatives
+                if max_alternatives_val > 0:
+                    # Truncar alternativas al máximo solicitado
+                    alternatives = match['alternatives']
+                    num_alternatives = len(alternatives)
+                    
+                    # Truncar si hay más de las solicitadas
+                    if num_alternatives > max_alternatives_val:
+                        match['alternatives'] = alternatives[:max_alternatives_val]
+                        num_alternatives = max_alternatives_val
+                    
+                    # Validar y agregar mensajes según corresponda
+                    if num_alternatives == 0:
+                        # No se encontraron alternativas
+                        match['message'] = "No se encontraron alternativas"
+                    elif num_alternatives < max_alternatives_val:
+                        # Hay algunas alternativas pero no todas las solicitadas
+                        match['message'] = "no se encontraron más alternativas"
+                    # Si num_alternatives == max_alternatives_val, no agregar mensaje (hay suficientes)
+                else:
+                    # Si no se solicitó max_alternatives, no agregar mensajes
+                    pass
+            
             total_search_tokens += response.usage.prompt_tokens + response.usage.completion_tokens             
             
             # 5. Calcular costos y tokens
