@@ -831,7 +831,7 @@ class OpenAIService:
                         match['message'] = "No se encontraron alternativas"
                     elif num_alternatives < max_alternatives_val:
                         # Hay algunas alternativas pero no todas las solicitadas
-                        match['message'] = "no se encontraron más alternativas"
+                        match['message'] = "No se encontraron más alternativas"
                     # Si num_alternatives == max_alternatives_val, no agregar mensaje (hay suficientes)
                 else:
                     # Si no se solicitó max_alternatives, no agregar mensajes
