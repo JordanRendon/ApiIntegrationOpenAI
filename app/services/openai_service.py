@@ -10,7 +10,7 @@ import numpy as np
 import faiss
 from dotenv import load_dotenv
 from typing import Union, List, Dict, Any, Tuple
-from models import VectorCache
+from app.services.vector_cache import VectorCache
 
 load_dotenv()
 

@@ -157,7 +157,7 @@ curl -X POST "http://localhost:8000/catalog/analyze?use_cache=true" \
 
 ## ⚙️ Configuración
 
-### Parámetros del Caché (en `models.py`):
+### Parámetros del Caché (en `app/services/vector_cache.py`):
 ```python
 class ConversationCache:
     def __init__(self):

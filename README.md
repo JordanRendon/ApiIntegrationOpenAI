@@ -4,10 +4,22 @@ FastAPI application for catalog search, file analysis and data processing using 
 
 ## 📁 Structure
 
-- `main.py` - FastAPI application with CORS configuration
-- `controller.py` - API endpoints (routes)
-- `openai_service.py` - OpenAI service integration
-- `models.py` - Pydantic models for request/response validation
+```
+app/
+├── api/
+│   └── routers/
+│       ├── catalog.py        # Endpoints de catálogo
+│       ├── data_analysis.py  # Endpoints de análisis de archivos
+│       └── health.py         # Healthcheck
+├── dependencies.py           # Providers compartidos (OpenAIService, etc.)
+├── main.py                   # Instancia FastAPI y setup
+├── schemas/                  # Modelos Pydantic
+├── services/                 # Lógica de negocio (OpenAI, vector cache)
+└── utils/                    # Helpers (ngrok tunnel manager)
+
+main.py                      # Wrapper para ejecutar `app.main`
+start_with_tunnel.py         # Script CLI para levantar con túnel
+```
 
 ## 🔌 Endpoints
 
